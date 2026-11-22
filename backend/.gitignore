@@ -1,0 +1,12 @@
+# Backend specific gitignore
+.env
+.env*
+*.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+telegram_bot.lock
+*.log
+test_*.pdf

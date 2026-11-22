@@ -1,0 +1,69 @@
+# ==============================================================================
+# OBRAEXACTA - GLOBAL .GITIGNORE
+# ==============================================================================
+
+# 1. Environment & API Secrets (CRITICAL: NEVER COMMIT)
+.env
+.env*
+*.env
+*.env.local
+*.env.*.local
+backend/.env
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+*.pem
+*.key
+*.cert
+
+# 2. Python & Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+backend/.venv/
+__pycache__/
+*/__pycache__/
+*/**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+telegram_bot.lock
+
+# 3. Node.js & Next.js Frontend
+node_modules/
+frontend/node_modules/
+.next/
+frontend/.next/
+out/
+frontend/out/
+build/
+.pnp
+.pnp.js
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+*.tsbuildinfo
+next-env.d.ts
+
+# 4. Operating System & Editor Files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 5. Temporary & Generated Test Files
+*.tmp
+*.log
+backend/*.log
+test_*.pdf
+test_*.png
+test_*.jpg
+check_bot.py
