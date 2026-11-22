@@ -212,7 +212,10 @@ class ObraExactaTelegramBot:
         lineas.append("\n📸 *También puedes enviar una FOTO de la obra con el avance en texto o nota de voz.*")
 
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("\n".join(lineas), reply_markup=reply_markup, parse_mode="Markdown")
+        if update.callback_query and update.callback_query.message:
+            await update.callback_query.edit_message_text("\n".join(lineas), reply_markup=reply_markup, parse_mode="Markdown")
+        elif update.message:
+            await update.message.reply_text("\n".join(lineas), reply_markup=reply_markup, parse_mode="Markdown")
 
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Maneja los toques en botones interactivos de la cuadrilla."""
@@ -518,7 +521,7 @@ class ObraExactaTelegramBot:
                 f"✅ *PRESUPUESTO ESTIMADO (NORMA COVENIN)*\n"
                 f"🏗️ *Obra:* `{obra['nombre']}`\n"
                 f"💵 *Tasa BCV:* `{tasa_bcv:,.2f} Bs/$`\n\n"
-                "*Partidas Cubicadas:*\n" + "\n".join(lineas_partidas) + "\n\n"
+                "*Partidas de Obra (Cómputos Métricos):*\n" + "\n".join(lineas_partidas) + "\n\n"
                 "📦 *Lista Resumida de Compras:*\n" + "\n".join(lineas_materiales) + "\n\n"
                 f"💼 *Subtotal:* ${presupuesto_calc.subtotal_usd:,.2f} (Bs. {presupuesto_calc.subtotal_bs:,.2f})\n"
                 f"🏛️ *Cargas e Indirectos (Ley Pensiones):* ${presupuesto_calc.total_cargas_usd:,.2f}\n"

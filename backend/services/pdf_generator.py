@@ -143,7 +143,7 @@ class PDFPresupuestoGenerator:
         # 2. TABLA PRINCIPAL DE PARTIDAS (7 COLUMNAS COVENIN)
         pdf.set_font('helvetica', 'B', 10)
         pdf.set_text_color(15, 23, 42)
-        pdf.cell(0, 6, '1. PARTIDAS DE OBRA CUBICADAS (NORMA COVENIN)', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(0, 6, '1. PARTIDAS DE OBRA Y COMPUTOS METRICOS (NORMA COVENIN)', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(1)
 
         # Anchos en mm para A4 (190 mm utilizables):

@@ -58,7 +58,15 @@ class SiteLogService:
             audio_bytes=audio_bytes
         )
 
-        tipo = classified.get("tipo") or ("avance_obra" if classified.get("intencion") in ("avance_cuadrilla", "avance_obra") else classified.get("intencion", "avance_obra"))
+        texto_lower = (text_or_audio or "").lower()
+        es_dano_explicito = any(w in texto_lower for w in ["dano", "daño", "parada", "paro", "tuberia", "tubería", "filtracion", "filtración", "roto", "rota", "fuga", "oculto", "averia", "avería", "accidente"])
+
+        # Una foto de campo sin daño explícito es SIEMPRE evidencia de avance
+        if not es_dano_explicito and (image_bytes or classified.get("intencion") in ("avance_cuadrilla", "avance_obra", "levantamiento_nuevo")):
+            tipo = "avance_obra"
+        else:
+            tipo = classified.get("tipo") or ("avance_obra" if classified.get("intencion") in ("avance_cuadrilla", "avance_obra") else classified.get("intencion", "avance_obra"))
+
         if tipo == "avance_cuadrilla":
             tipo = "avance_obra"
 
@@ -84,6 +92,28 @@ class SiteLogService:
                     if p.get("tipo_partida") == partida_ref:
                         target_partida = p
                         break
+
+            # Si no hubo coincidencia directa, buscar por sinónimos o descripción (ej. "moldear bloque", "pegar bloque" -> pared_bloque)
+            if not target_partida and partidas:
+                for p in partidas:
+                    tipo_p = p.get("tipo_partida", "").lower()
+                    desc_p = p.get("descripcion", "").lower()
+                    if any(w in texto_lower for w in ["bloque", "pared", "friso", "moldear", "pegar", "albañileria", "albanileria"]) and ("bloque" in tipo_p or "bloque" in desc_p or "pared" in tipo_p):
+                        target_partida = p
+                        break
+                    elif any(w in texto_lower for w in ["pintar", "pintura", "caucho", "esmalte"]) and ("pintura" in tipo_p or "pintar" in desc_p):
+                        target_partida = p
+                        break
+                    elif any(w in texto_lower for w in ["ceramica", "cerámica", "porcelanato", "piso", "pego"]) and ("ceramica" in tipo_p or "piso" in desc_p or "ceramica" in desc_p):
+                        target_partida = p
+                        break
+                    elif any(w in texto_lower for w in ["cielo", "raso", "drywall", "yeso"]) and ("cielo_raso" in tipo_p or "cielo" in desc_p):
+                        target_partida = p
+                        break
+                    elif any(w in texto_lower for w in ["lampara", "lámpara", "led", "luminaria", "luz"]) and ("lampara" in tipo_p or "lampara" in desc_p):
+                        target_partida = p
+                        break
+
             if not target_partida and partidas:
                 target_partida = partidas[0]
 
