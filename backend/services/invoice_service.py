@@ -167,7 +167,8 @@ class InvoiceService:
             "alerta_fuera_partida": alerta_fuera_partida,
             "alerta_duplicada": False,
             "detalle_alerta": detalle_alerta,
-            "items": items
+            "items": items,
+            "user_id": obra.get("user_id")
         }
 
         saved_factura = supabase_service.save_factura(factura_data)

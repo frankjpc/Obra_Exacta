@@ -106,3 +106,59 @@ npm install
 npm run dev
 # Abrir http://localhost:3000
 ```
+
+---
+
+## 🤖 4. Conexión del Servidor MCP (Model Context Protocol) en Gemini / Antigravity / Cursor
+
+ObraExacta expone un servidor **FastMCP** con transporte HTTP/SSE y aislamiento estricto por usuario:
+
+### URL de Conexión MCP
+- **Endpoint Integrado (FastAPI):** `http://localhost:8000/mcp/sse`
+- **Endpoint Servidor Dedicado:** `http://localhost:8001/sse` (ejecutando `python mcp_server.py --port 8001`)
+
+### Autenticación Multiusuario
+Cada contratista tiene una clave personal `api_key_mcp` (visible y copiable en la barra lateral del dashboard, ej: `obx_mcp_demo_7f8a9b2c3d4e5f6a7b8c9d0e`).
+El servidor MCP valida la clave mediante:
+- Header HTTP: `Authorization: Bearer <api_key_mcp>` o `X-API-Key: <api_key_mcp>`
+- Parámetro de herramienta: `api_key_mcp="<tu_clave>"` (opcional para clientes que no envían headers personalizados).
+
+### 🛠️ Las 4 Herramientas Deterministas Expuestas
+
+1. `listar_obras_usuario()`:
+   - Devuelve las obras activas, presupuesto base contratado, total gastado y margen disponible exclusivamente de ese contratista.
+2. `consultar_precios_y_covenin()`:
+   - Devuelve el catálogo de partidas oficiales COVENIN de Venezuela y los precios unitarios de materiales y mano de obra personalizados por ese contratista.
+3. `evaluar_levantamiento(obra_nombre, descripcion_trabajo)`:
+   - Aplica el Loop Incisivo: si faltan datos críticos, formula hasta 2 preguntas aclaratorias cortas de campo; si la información está completa, calcula deterministamente el presupuesto COVENIN.
+4. `obtener_resumen_obra(obra_nombre)`:
+   - Devuelve el resumen integral de la obra: partidas, avance ponderado y por cuadrilla, facturas/gastos registrados y variación por órdenes de trabajo adicionales (daños ocultos).
+
+### 📋 Configuración en Clientes MCP
+
+#### En Gemini / Antigravity / Claude Desktop (`claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "obraexacta": {
+      "url": "http://localhost:8000/mcp/sse",
+      "headers": {
+        "Authorization": "Bearer obx_mcp_demo_7f8a9b2c3d4e5f6a7b8c9d0e"
+      }
+    }
+  }
+}
+```
+
+#### Modo CLI Stdio (Opcional):
+```json
+{
+  "mcpServers": {
+    "obraexacta_local": {
+      "command": "python",
+      "args": ["c:/SaaS/backend/mcp_server.py", "--transport", "stdio"]
+    }
+  }
+}
+```
+

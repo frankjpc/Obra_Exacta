@@ -1,5 +1,6 @@
 import io
 import re
+import uuid
 import asyncio
 from typing import Optional, Any
 from telegram import (
@@ -24,6 +25,8 @@ from services.invoice_service import invoice_service
 from services.site_log_service import site_log_service
 from services.bcv_service import bcv_service
 from services.pdf_generator import PDFPresupuestoGenerator
+from services.levantamiento_skill import levantamiento_skill
+from services.session_manager import session_manager
 
 class ObraExactaTelegramBot:
     def __init__(self):
@@ -49,6 +52,7 @@ class ObraExactaTelegramBot:
             # Comandos
             self.app.add_handler(CommandHandler("start", self.cmd_start))
             self.app.add_handler(CommandHandler("ayuda", self.cmd_ayuda))
+            self.app.add_handler(CommandHandler("vincular", self.cmd_vincular))
             self.app.add_handler(CommandHandler("obras", self.cmd_obras))
             self.app.add_handler(CommandHandler("activa", self.cmd_activa))
             self.app.add_handler(CommandHandler("estado", self.cmd_estado))
@@ -73,6 +77,9 @@ class ObraExactaTelegramBot:
             # Manejador de Mensajes de Texto libres
             self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
 
+            # Manejador de Errores Global (Prevención de bucle de conflicto)
+            self.app.add_error_handler(self.global_error_handler)
+
             self.bot_info["status"] = "ready"
             return self.app
         except Exception as e:
@@ -80,17 +87,37 @@ class ObraExactaTelegramBot:
             self.bot_info["status"] = f"error: {e}"
             return None
 
+    async def global_error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Captura errores de Telegram de forma limpia evitando loops de reintento en caso de conflicto."""
+        err_str = str(context.error) if context.error else ""
+        if "conflict" in err_str.lower() or "terminated by other getupdates" in err_str.lower():
+            print("Aviso Telegram: Conflicto de instancia detectado (otra instancia solicitó updates). Deteniendo polling para evitar colisión.")
+            self.bot_info["status"] = "stopped_conflict"
+            self.bot_info["polling"] = False
+            if self.app and self.app.updater and self.app.updater.running:
+                try:
+                    await self.app.updater.stop()
+                except Exception:
+                    pass
+            return
+        print(f"Aviso Telegram Bot: {context.error}")
+
     # --------------------------------------------------------------------------
     # COMANDOS DE TELEGRAM
     # --------------------------------------------------------------------------
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
-        obra = supabase_service.get_or_create_active_obra(chat_id)
+        perfil = supabase_service.get_perfil_by_chat_id(chat_id)
+        user_id = perfil.get("user_id") if perfil else None
+        obra = supabase_service.get_or_create_active_obra(chat_id, user_id=user_id)
         tasa = float(obra.get("tasa_bcv", settings.TASA_BCV_DEFAULT))
+        
+        vinculacion_str = "🟢 *Cuenta Web Vinculada*" if perfil else "🟡 *Chat no vinculado.* Usa `/vincular <codigo>`"
         
         texto = (
             "🏗️ *¡Bienvenido a ObraExacta Bot!* \n\n"
             "Tu copiloto de cubicación, control de compras y libro de obra para contratistas y cuadrillas.\n\n"
+            f"👤 *Estado:* {vinculacion_str}\n"
             f"📍 *Obra activa:* `{obra.get('nombre')}`\n"
             f"💵 *Tasa BCV Oficial:* `{tasa:,.2f} Bs/USD`\n\n"
             "👷‍♂️ *¿Cómo puede reportar la cuadrilla en campo?*\n"
@@ -98,6 +125,7 @@ class ObraExactaTelegramBot:
             "• *Foto de trabajo:* Con caption 'Pared al 85%' o 'Avance pintura'.\n"
             "• *Nota de voz:* 'Terminamos la cerámica en el piso 8'.\n\n"
             "🧾 *Otras funciones:*\n"
+            "• `/vincular <codigo>` - Enlazar este chat a tu cuenta en la app web.\n"
             "• `/bcv` - Sincronizar y consultar la Tasa Oficial del Banco Central de Venezuela.\n"
             "• Envía foto de factura de ferretería para auditar sobreprecio y duplicados.\n"
             "• Envía nota de voz dictando medidas para calcular nuevo presupuesto 2D.\n"
@@ -109,10 +137,11 @@ class ObraExactaTelegramBot:
     async def cmd_ayuda(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         texto = (
             "📋 *Comandos de ObraExacta:*\n\n"
+            "/vincular <codigo> - Enlazar este chat a tu cuenta de la app web\n"
             "/avance o /cuadrilla - Ver y actualizar avances por partida en 1 toque\n"
             "/bcv - Consultar y sincronizar Tasa Oficial del BCV en vivo\n"
             "/estado - Ver balance presupuestario y avance global ponderado\n"
-            "/obras - Listar todas las obras registradas\n"
+            "/obras - Listar todas tus obras registradas\n"
             "/activa <id> - Cambiar la obra activa para este chat\n"
             "/limpiar o /reset - Borrar partidas y empezar en limpio desde cero ($0.00)\n"
             "/start - Iniciar el bot y ver obra activa\n"
@@ -123,6 +152,8 @@ class ObraExactaTelegramBot:
     async def cmd_limpiar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Limpia completamente todas las partidas, facturas y registros de prueba."""
         chat_id = update.effective_chat.id
+        levantamiento_skill.clear_session(chat_id)
+        session_manager.clear_chat_sessions(chat_id)
         status_msg = await update.message.reply_text("🧹 *Limpiando toda la base de datos y partidas...*", parse_mode="Markdown")
         try:
             _ = await asyncio.to_thread(supabase_service.clear_all_data, create_default=True)
@@ -294,13 +325,65 @@ class ObraExactaTelegramBot:
         elif data == "back_cuadrilla":
             await self.cmd_cuadrilla(update, context)
 
-    async def cmd_obras(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        obras = supabase_service.get_obras()
-        if not obras:
-            await update.message.reply_text("No hay obras registradas. Usa /start para crear la obra demo.")
+    async def cmd_vincular(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        args = context.args or []
+        if not args:
+            perfil_actual = supabase_service.get_perfil_by_chat_id(chat_id)
+            if perfil_actual:
+                await update.message.reply_text(
+                    f"✅ *Este chat ya está vinculado a ObraExacta.*\n\n"
+                    f"👤 *Usuario ID:* `{perfil_actual.get('user_id')}`\n"
+                    f"🔑 *Código:* `{perfil_actual.get('codigo_vinculacion')}`\n\n"
+                    "Todas tus notas de voz, fotos y facturas se asocian a tus obras privadas.",
+                    parse_mode="Markdown"
+                )
+                return
+
+            texto = (
+                "🔗 *Vinculación de Cuenta con ObraExacta*\n\n"
+                "Para sincronizar este chat de Telegram con tu cuenta de la app web:\n\n"
+                "1. Abre ObraExacta en tu navegador.\n"
+                "2. En el menú lateral (Sidebar), copia tu *Código de Vinculación* de 6 dígitos.\n"
+                "3. Escribe aquí:\n"
+                "   👉 `/vincular <codigo>`\n"
+                "   Ejemplo: `/vincular 482910`"
+            )
+            await update.message.reply_text(texto, parse_mode="Markdown")
             return
 
-        lineas = ["🏗️ *Obras Disponibles:*"]
+        codigo = args[0].strip()
+        perfil = supabase_service.vincular_telegram_chat(codigo, chat_id)
+        if perfil:
+            user_id = perfil.get("user_id", "demo")
+            texto = (
+                "✅ *¡Cuenta Vinculada Exitosamente!*\n\n"
+                f"Este chat de Telegram (`{chat_id}`) ahora está enlazado a tu usuario de ObraExacta.\n\n"
+                "🏗️ *A partir de este momento:*\n"
+                "• Todas las cubicaciones por voz se registran en tus proyectos personales.\n"
+                "• Tus facturas de compra y auditorías se guardan en tu cuenta.\n"
+                "• El catálogo de precios aprendidos se aplicará a tus presupuestos.\n\n"
+                "🎙️ *¡Comienza a medir!* Envíame un audio diciendo: _'Cúbícame 20 metros cuadrados de bloque en la Obra Torre Polar'_"
+            )
+            await update.message.reply_text(texto, parse_mode="Markdown")
+        else:
+            texto = (
+                "❌ *Código de vinculación inválido o no encontrado.*\n\n"
+                f"El código `{codigo}` no coincide con ninguna cuenta activa.\n"
+                "Verifica tu código en el menú lateral de la app web de ObraExacta e inténtalo de nuevo."
+            )
+            await update.message.reply_text(texto, parse_mode="Markdown")
+
+    async def cmd_obras(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        perfil = supabase_service.get_perfil_by_chat_id(chat_id)
+        user_id = perfil.get("user_id") if perfil else None
+        obras = supabase_service.get_obras(user_id=user_id)
+        if not obras:
+            await update.message.reply_text("No hay obras registradas. Usa /start para crear una obra inicial.")
+            return
+
+        lineas = ["🏗️ *Tus Obras Disponibles:*"]
         for o in obras:
             lineas.append(f"• `{o['id']}`: *{o['nombre']}* ({o['cliente']}) - ${o.get('presupuesto_total_usd', 0):,.2f}")
         lineas.append("\nPara cambiar a una obra: `/activa <id>`")
@@ -373,7 +456,34 @@ class ObraExactaTelegramBot:
                 await status_msg.edit_text(f"⚠️ {extracted['error']}")
                 return
 
+            # Resolver contexto orquestado de obra y sesión
+            context_res = await asyncio.to_thread(
+                session_manager.resolve_context,
+                chat_id=chat_id,
+                audio_transcript=extracted.get("descripcion")
+            )
+            obra = context_res.obra
+
+            if context_res.mensaje_aviso and context_res.accion in ["retoma_obra", "nueva_obra"]:
+                await update.message.reply_text(context_res.mensaje_aviso, parse_mode="Markdown")
+
+            levantamiento_skill.sync_session_from_db(chat_id, context_res.session_db)
+
             intencion = extracted.get("intencion", "levantamiento_nuevo")
+
+            # Si es respuesta al loop de aclaración o levantamiento en curso
+            if context_res.accion == "respuesta_aclaracion" or levantamiento_skill.has_active_session(chat_id):
+                if intencion not in ["avance_cuadrilla", "parada_dano_oculto"]:
+                    await self._process_levantamiento_flow(
+                        update=update,
+                        obra=obra,
+                        audio_bytes=audio_bytes,
+                        mime_type="audio/ogg",
+                        status_msg=status_msg,
+                        pre_extracted=extracted,
+                        session_db=context_res.session_db
+                    )
+                    return
 
             if intencion == "avance_cuadrilla":
                 await self._process_incident_or_progress_flow(
@@ -411,7 +521,8 @@ class ObraExactaTelegramBot:
                     audio_bytes=audio_bytes,
                     mime_type="audio/ogg",
                     status_msg=status_msg,
-                    pre_extracted=extracted
+                    pre_extracted=extracted,
+                    session_db=context_res.session_db
                 )
         except Exception as e:
             print(f"Error procesando voz en Telegram: {e}")
@@ -446,42 +557,106 @@ class ObraExactaTelegramBot:
         obra: dict, 
         audio_bytes: Optional[bytes] = None, 
         text_prompt: Optional[str] = None,
+        image_bytes: Optional[bytes] = None,
         mime_type: str = "audio/ogg",
         status_msg: Optional[Any] = None,
-        pre_extracted: Optional[dict] = None
+        pre_extracted: Optional[dict] = None,
+        session_db: Optional[dict] = None
     ):
         if not status_msg:
-            status_msg = await update.message.reply_text("📐 *Procesando levantamiento con IA y cubicador determinista...*", parse_mode="Markdown")
+            status_msg = await update.message.reply_text("📐 *Analizando levantamiento técnico con IA...*", parse_mode="Markdown")
         else:
-            await status_msg.edit_text("📐 *Cubicando partidas y dimensiones con IA...*", parse_mode="Markdown")
+            await status_msg.edit_text("📐 *Analizando levantamiento técnico con IA...*", parse_mode="Markdown")
         
         try:
-            if pre_extracted:
-                extracted = pre_extracted
-            else:
-                extracted = await asyncio.to_thread(
-                    gemini_service.parse_audio_or_text_levantamiento,
-                    audio_bytes=audio_bytes,
-                    text_prompt=text_prompt,
-                    mime_type=mime_type
+            chat_id = update.effective_chat.id
+            obra_id = obra["id"]
+            obra_nombre = obra.get("nombre", "Obra")
+
+            if pre_extracted and not text_prompt:
+                text_prompt = pre_extracted.get("descripcion")
+
+            # Asegurar contexto de sesión en Supabase si no vino precargado
+            if not session_db:
+                context_res = await asyncio.to_thread(
+                    session_manager.resolve_context,
+                    chat_id=chat_id,
+                    text=text_prompt
                 )
-            raw_partidas = extracted.get("partidas", [])
-            if not raw_partidas:
-                await status_msg.edit_text("⚠️ No se identificaron partidas de construcción en el audio/texto. Por favor detalla dimensiones (ej. pared 6x2.80, 30m2 pintura).")
+                session_db = context_res.session_db
+
+            historial_mensajes = session_db.get("historial_mensajes") or []
+
+            # Si se adjuntó una foto del área de trabajo, subirla a Supabase Storage / local
+            foto_url = None
+            if image_bytes:
+                try:
+                    foto_url = await asyncio.to_thread(
+                        supabase_service.upload_file,
+                        image_bytes,
+                        "foto_area_levantamiento.jpg",
+                        "image/jpeg"
+                    )
+                except Exception as efoto:
+                    print(f"Aviso subiendo foto de área de trabajo: {efoto}")
+
+            # Evaluar y acumular datos en el Loop de Levantamiento Incisivo
+            resultado = await asyncio.to_thread(
+                levantamiento_skill.evaluar_o_acumular,
+                chat_id=chat_id,
+                obra_id=obra_id,
+                obra_nombre=obra_nombre,
+                texto_usuario=text_prompt,
+                audio_bytes=audio_bytes,
+                image_bytes=image_bytes,
+                foto_url=foto_url,
+                historial_mensajes=historial_mensajes,
+                mime_type=mime_type
+            )
+
+            # ------------------------------------------------------------------
+            # 1. ESTADO: NECESITA ACLARACIÓN
+            # El bot guarda el borrador en progreso y responde con la pregunta corta
+            # y solicita foto del área de trabajo si aún no se tiene.
+            # ------------------------------------------------------------------
+            if resultado.estado == "necesita_aclaracion":
+                pregunta = resultado.pregunta_corta or "¿Podrías indicar las dimensiones y tipo de material?"
+                if resultado.solicitar_foto and not resultado.datos_acumulados.foto_area_url:
+                    if "foto" not in pregunta.lower():
+                        pregunta += "\n\n📸 *Por favor envía también una foto del área donde se va a trabajar.*"
+
+                # Persistir sesión en estado 'esperando_aclaracion' con el borrador actualizado y los mensajes
+                session_id = session_db.get("id") or str(uuid.uuid4())
+                current_session = levantamiento_skill.get_session(chat_id)
+                current_rounds = current_session.round_count if current_session else 1
+                await asyncio.to_thread(
+                    session_manager.save_session_state,
+                    chat_id=chat_id,
+                    session_id=session_id,
+                    obra_id=obra_id,
+                    obra_nombre=obra_nombre,
+                    estado="esperando_aclaracion",
+                    rondas_preguntas=current_rounds,
+                    borrador_json=resultado.datos_acumulados.model_dump(),
+                    user_msg=text_prompt,
+                    bot_msg=pregunta
+                )
+                
+                await status_msg.edit_text(pregunta, parse_mode="Markdown")
                 return
 
-            partidas_input = [
-                PartidaInput(
-                    tipo_partida=p.get("tipo_partida", "otro"),
-                    descripcion=p.get("descripcion"),
-                    largo=p.get("largo", 0.0),
-                    alto=p.get("alto", 0.0),
-                    cantidad=p.get("cantidad", 1.0),
-                    area=p.get("area", 0.0),
-                    unidad=p.get("unidad", "m2")
-                )
-                for p in raw_partidas
-            ]
+            # ------------------------------------------------------------------
+            # 2. ESTADO: LISTO PARA PRESUPUESTAR
+            # Pasa datos_acumulados a calculator.py, genera y envía el PDF COVENIN y limpia sesión
+            # ------------------------------------------------------------------
+            partidas_input = levantamiento_skill.convertir_a_partidas_calculator(resultado.datos_acumulados)
+            if not partidas_input:
+                levantamiento_skill.clear_session(chat_id)
+                session_id = session_db.get("id") if session_db else None
+                if session_id:
+                    await asyncio.to_thread(session_manager.complete_session, chat_id, session_id)
+                await status_msg.edit_text("⚠️ No se identificaron partidas de construcción. Por favor detalla dimensiones (ej. pared 6x2.80, 30m2 pintura).")
+                return
 
             tasa_bcv = float(obra.get("tasa_bcv", settings.TASA_BCV_DEFAULT))
             precios_dict = supabase_service.get_catalogo_precios_dict()
@@ -505,6 +680,20 @@ class ObraExactaTelegramBot:
                 "presupuesto_total_bs": presupuesto_calc.total_general_bs
             })
 
+            # Si se recibió foto del área de trabajo, registrarla en el diario de obra
+            if resultado.datos_acumulados.foto_area_url:
+                try:
+                    supabase_service.save_diario_obra({
+                        "obra_id": obra_id,
+                        "tipo": "inspeccion",
+                        "titulo": "Levantamiento Inicial y Cómputos Métricos",
+                        "descripcion": "Foto del área de trabajo inspeccionada para cómputos métricos COVENIN.",
+                        "foto_url": resultado.datos_acumulados.foto_area_url,
+                        "responsable_nombre": "Inspección Técnica"
+                    })
+                except Exception as ed:
+                    print(f"Aviso guardando diario de obra con foto de área: {ed}")
+
             lineas_partidas = []
             for p in presupuesto_calc.partidas:
                 lineas_partidas.append(f"• `[{p.codigo_covenin}]` *{p.descripcion}*: ${p.total_usd:,.2f} | Bs. {p.total_bs:,.2f}")
@@ -516,11 +705,13 @@ class ObraExactaTelegramBot:
                 lineas_materiales.append(f"  - y {len(presupuesto_calc.hoja_compras) - 5} materiales más...")
 
             link_web = f"{settings.FRONTEND_URL}/presupuestos?obra_id={obra_id}"
+            foto_tag = "📸 *Foto del Área:* Registrada e inspeccionada con IA\n" if resultado.datos_acumulados.foto_area_url else ""
 
             respuesta = (
                 f"✅ *PRESUPUESTO ESTIMADO (NORMA COVENIN)*\n"
                 f"🏗️ *Obra:* `{obra['nombre']}`\n"
-                f"💵 *Tasa BCV:* `{tasa_bcv:,.2f} Bs/$`\n\n"
+                f"💵 *Tasa BCV:* `{tasa_bcv:,.2f} Bs/$`\n"
+                f"{foto_tag}\n"
                 "*Partidas de Obra (Cómputos Métricos):*\n" + "\n".join(lineas_partidas) + "\n\n"
                 "📦 *Lista Resumida de Compras:*\n" + "\n".join(lineas_materiales) + "\n\n"
                 f"💼 *Subtotal:* ${presupuesto_calc.subtotal_usd:,.2f} (Bs. {presupuesto_calc.subtotal_bs:,.2f})\n"
@@ -550,6 +741,17 @@ class ObraExactaTelegramBot:
                 )
             except Exception as epdf:
                 print(f"Aviso generando/enviando PDF en Telegram: {epdf}")
+
+            # Persistir estado completado en Supabase y liberar sesión
+            session_id = session_db.get("id") if session_db else None
+            if session_id:
+                await asyncio.to_thread(
+                    session_manager.complete_session,
+                    chat_id=chat_id,
+                    session_id=session_id,
+                    borrador_final=resultado.datos_acumulados.model_dump()
+                )
+            levantamiento_skill.clear_session(chat_id)
 
         except Exception as e:
             print(f"Error procesando levantamiento: {e}")
@@ -765,6 +967,42 @@ class ObraExactaTelegramBot:
                 chat_id=chat_id,
                 responsable_nombre=f"Cuadrilla ({user_name})"
             )
+        elif levantamiento_skill.has_active_session(chat_id):
+            # El usuario está enviando la foto solicitada del área donde se va a trabajar
+            context_res = await asyncio.to_thread(
+                session_manager.resolve_context,
+                chat_id=chat_id,
+                text=caption
+            )
+            obra = context_res.obra
+            levantamiento_skill.sync_session_from_db(chat_id, context_res.session_db)
+            status_msg = await update.message.reply_text("📸 *Analizando foto del área de trabajo con IA...*", parse_mode="Markdown")
+            await self._process_levantamiento_flow(
+                update=update,
+                obra=obra,
+                image_bytes=image_bytes,
+                text_prompt=caption or None,
+                status_msg=status_msg,
+                session_db=context_res.session_db
+            )
+        elif any(w in caption_lower for w in ["levantamiento", "cotizar", "presupuesto", "pared", "medidas", "m2", "metro"]):
+            # Nueva solicitud de levantamiento iniciada con foto del área y medidas en caption
+            context_res = await asyncio.to_thread(
+                session_manager.resolve_context,
+                chat_id=chat_id,
+                text=caption
+            )
+            obra = context_res.obra
+            levantamiento_skill.sync_session_from_db(chat_id, context_res.session_db)
+            status_msg = await update.message.reply_text("📐 *Iniciando levantamiento desde foto con IA...*", parse_mode="Markdown")
+            await self._process_levantamiento_flow(
+                update=update,
+                obra=obra,
+                image_bytes=image_bytes,
+                text_prompt=caption,
+                status_msg=status_msg,
+                session_db=context_res.session_db
+            )
         else:
             # Por defecto en obra de campo: una foto subida por la cuadrilla es EVIDENCIA DE AVANCE
             await self._process_incident_or_progress_flow(
@@ -892,10 +1130,41 @@ class ObraExactaTelegramBot:
     # --------------------------------------------------------------------------
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
-        obra = supabase_service.get_or_create_active_obra(chat_id)
         user_name = update.effective_user.first_name or "Cuadrilla"
         texto = update.message.text or ""
         lower = texto.lower()
+
+        # Si el usuario quiere cancelar o reiniciar el levantamiento activo
+        if lower.strip() in ["cancelar", "cancelar levantamiento", "salir", "reiniciar"]:
+            levantamiento_skill.clear_session(chat_id)
+            session_manager.clear_chat_sessions(chat_id)
+            await update.message.reply_text("❌ Levantamiento técnico cancelado.")
+            return
+
+        # Resolver contexto orquestado de obra y sesión
+        context_res = await asyncio.to_thread(
+            session_manager.resolve_context,
+            chat_id=chat_id,
+            text=texto
+        )
+        obra = context_res.obra
+
+        # Si detectó retoma de obra o nueva obra, enviar aviso
+        if context_res.mensaje_aviso and context_res.accion in ["retoma_obra", "nueva_obra"]:
+            await update.message.reply_text(context_res.mensaje_aviso, parse_mode="Markdown")
+
+        # Sincronizar el borrador persistente en levantamiento_skill
+        levantamiento_skill.sync_session_from_db(chat_id, context_res.session_db)
+
+        # REGLA 4: Si ya tiene una sesión en estado 'esperando_aclaracion', asume que el mensaje es la respuesta
+        if context_res.accion == "respuesta_aclaracion" or levantamiento_skill.has_active_session(chat_id):
+            await self._process_levantamiento_flow(
+                update=update,
+                obra=obra,
+                text_prompt=texto,
+                session_db=context_res.session_db
+            )
+            return
 
         # Si menciona edición de presupuesto o cambios de precio / cantidad
         if any(w in lower for w in ["cambia", "cámbiale", "sube", "baja", "ajusta", "agrega", "pon el bloque", "pon la pintura", "precio de"]):
@@ -933,7 +1202,12 @@ class ObraExactaTelegramBot:
             )
         # Si es levantamiento o cubicación
         else:
-            await self._process_levantamiento_flow(update, obra, None, text_prompt=texto)
+            await self._process_levantamiento_flow(
+                update=update,
+                obra=obra,
+                text_prompt=texto,
+                session_db=context_res.session_db
+            )
 
     # --------------------------------------------------------------------------
     # NOTIFICACIÓN AUTOMÁTICA AL INGENIERO TRAS APROBACIÓN

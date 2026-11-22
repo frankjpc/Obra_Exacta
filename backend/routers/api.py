@@ -24,6 +24,8 @@ class ObraCreate(BaseModel):
     direccion: Optional[str] = ""
     tasa_bcv: Optional[float] = 68.50
     margen_meta: Optional[float] = 30.0
+    user_id: Optional[str] = None
+    telegram_chat_id: Optional[int] = None
 
 class ObraUpdate(BaseModel):
     nombre: Optional[str] = None
@@ -99,8 +101,8 @@ def reset_database():
 # OBRAS
 # ------------------------------------------------------------------------------
 @router.get("/obras")
-def list_obras():
-    return supabase_service.get_obras()
+def list_obras(user_id: Optional[str] = None):
+    return supabase_service.get_obras(user_id=user_id)
 
 @router.get("/obras/{obra_id}")
 def get_obra(obra_id: str):
@@ -111,7 +113,7 @@ def get_obra(obra_id: str):
 
 @router.post("/obras")
 def create_obra(data: ObraCreate):
-    return supabase_service.create_obra(data.model_dump())
+    return supabase_service.create_obra(data.model_dump(), user_id=data.user_id)
 
 @router.patch("/obras/{obra_id}")
 def update_obra(obra_id: str, data: ObraUpdate):
@@ -323,9 +325,9 @@ def descargar_presupuesto_pdf(obra_id: str):
     )
 
 @router.get("/memoria-precios")
-def get_memoria_precios():
+def get_memoria_precios(user_id: Optional[str] = None):
     """Devuelve los precios aprendidos de la memoria operativa del contratista."""
-    return supabase_service.get_catalogo_precios()
+    return supabase_service.get_catalogo_precios(user_id=user_id)
 
 @router.post("/memoria-precios")
 def save_memoria_precio(data: MemoriaPrecioInput):
@@ -518,3 +520,49 @@ def get_uploaded_file(filename: str):
     if not os.path.exists(safe_path):
         raise HTTPException(status_code=404, detail="Archivo no encontrado")
     return FileResponse(safe_path)
+
+# ------------------------------------------------------------------------------
+# PERFILES TELEGRAM & VINCULACIÓN MULTIUSUARIO
+# ------------------------------------------------------------------------------
+class VincularRequest(BaseModel):
+    codigo: str
+    chat_id: str
+
+@router.get("/perfil")
+def get_perfil_usuario(user_id: Optional[str] = None, chat_id: Optional[str] = None):
+    """Obtiene o inicializa el perfil con código de vinculación y API Key MCP."""
+    if user_id:
+        return supabase_service.get_or_create_perfil(user_id)
+    if chat_id:
+        p = supabase_service.get_perfil_by_chat_id(chat_id)
+        if p:
+            return p
+    # Demo por defecto
+    demo_id = "00000000-0000-0000-0000-000000000001"
+    return supabase_service.get_or_create_perfil(demo_id)
+
+@router.post("/perfil/vincular")
+def vincular_telegram(data: VincularRequest):
+    """Vincula un chat de Telegram mediante el código de 6 dígitos."""
+    perfil = supabase_service.vincular_telegram_chat(data.codigo, data.chat_id)
+    if not perfil:
+        raise HTTPException(status_code=400, detail="Código de vinculación inválido o expirado")
+    return {
+        "status": "success",
+        "message": "Chat de Telegram vinculado exitosamente.",
+        "perfil": perfil
+    }
+
+class McpChatRequest(BaseModel):
+    prompt: str
+    api_key_mcp: Optional[str] = None
+
+@router.post("/mcp/chat")
+def mcp_chat_agent(req: McpChatRequest):
+    """
+    Ejecuta una consulta inteligente a Gemini conectada directamente con las herramientas del servidor MCP.
+    Permite probar interactivamente el Agente IA desde la interfaz web o aplicaciones cliente.
+    """
+    from demo_gemini_mcp import procesar_consulta_gemini_mcp
+    resultado = procesar_consulta_gemini_mcp(req.prompt, req.api_key_mcp)
+    return resultado

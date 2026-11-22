@@ -1,7 +1,9 @@
 import os
 import uuid
+import random
+import secrets
 import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from config import settings
 
 def to_uuid(val: Any) -> str:
@@ -36,10 +38,25 @@ class SupabaseService:
             "hoja_compras": {},
             "cargas_fiscales": {},
             "facturas": {},
+            "gastos": {},
             "evidencias_avance": {},
             "libro_obra": {},
             "catalogo_precios_usuario": {},
-            "historial_ediciones": []
+            "historial_ediciones": [],
+            "sesiones_levantamiento": {},
+            "perfiles_telegram": {}
+        }
+
+        # Perfil demo predeterminado para pruebas instantáneas
+        demo_user_id = "00000000-0000-0000-0000-000000000001"
+        self._memory_store["perfiles_telegram"][demo_user_id] = {
+            "id": to_uuid("perfil-demo-001"),
+            "user_id": demo_user_id,
+            "telegram_chat_id": None,
+            "codigo_vinculacion": "482910",
+            "api_key_mcp": "obx_mcp_demo_7f8a9b2c3d4e5f6a7b8c9d0e",
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
 
         if settings.SUPABASE_URL and settings.SUPABASE_KEY:
@@ -57,14 +74,47 @@ class SupabaseService:
     # --------------------------------------------------------------------------
     # OBRAS
     # --------------------------------------------------------------------------
-    def get_obras(self) -> List[Dict[str, Any]]:
+    def get_obras(self, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        raw_obras = []
         if self.is_connected and self.client:
             try:
+                if user_id:
+                    try:
+                        res = self.client.table("obras").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
+                        if res.data is not None and len(res.data) > 0:
+                            return res.data
+                    except Exception:
+                        pass
                 res = self.client.table("obras").select("*").order("created_at", desc=True).execute()
-                return res.data or []
+                raw_obras = res.data or []
             except Exception as e:
                 print(f"Error Supabase get_obras: {e}")
-        return list(self._memory_store["obras"].values())
+
+        # Si no hay conexión o no hay obras en la nube, usar almacén en memoria
+        if not raw_obras:
+            all_mem = list(self._memory_store["obras"].values())
+            if user_id:
+                return [o for o in all_mem if str(o.get("user_id") or "") == str(user_id)]
+            return all_mem
+
+        # Enriquecer obras de la nube con user_id si la columna aún no existe en Supabase
+        mem_by_id = {str(o["id"]): o for o in self._memory_store["obras"].values()}
+        for o in raw_obras:
+            oid = str(o["id"])
+            if oid in mem_by_id and "user_id" in mem_by_id[oid] and "user_id" not in o:
+                o["user_id"] = mem_by_id[oid]["user_id"]
+
+        # Incluir obras en memoria que aún no se hayan sincronizado
+        cloud_ids = {str(o["id"]) for o in raw_obras}
+        for mid, mo in mem_by_id.items():
+            if mid not in cloud_ids:
+                raw_obras.append(mo)
+
+        if user_id:
+            filtered = [o for o in raw_obras if str(o.get("user_id") or "") == str(user_id)]
+            return filtered
+
+        return raw_obras
 
     def get_obra(self, obra_id: str) -> Optional[Dict[str, Any]]:
         clean_id = to_uuid(obra_id)
@@ -77,12 +127,21 @@ class SupabaseService:
                 print(f"Error Supabase get_obra: {e}")
         return self._memory_store["obras"].get(clean_id) or self._memory_store["obras"].get(obra_id)
 
-    def get_or_create_active_obra(self, chat_id: Optional[int] = None) -> Dict[str, Any]:
+    def get_or_create_active_obra(self, chat_id: Optional[int] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
         """Obtiene la obra activa del chat o la más reciente, o crea una por defecto limpia."""
-        obras = self.get_obras()
+        if not user_id and chat_id:
+            perfil = self.get_perfil_by_chat_id(chat_id)
+            if perfil:
+                user_id = perfil.get("user_id")
+
+        obras = self.get_obras(user_id=user_id)
         if chat_id:
             for o in obras:
                 if o.get("telegram_chat_id") == chat_id and o.get("estado") == "activa":
+                    return o
+        if user_id:
+            for o in obras:
+                if str(o.get("user_id") or "") == str(user_id) and o.get("estado") == "activa":
                     return o
         if obras:
             return obras[0]
@@ -108,11 +167,13 @@ class SupabaseService:
             "total_gastado_usd": 0.0,
             "total_gastado_bs": 0.0,
             "estado": "activa",
-            "telegram_chat_id": chat_id
-        })
+            "telegram_chat_id": chat_id,
+            "user_id": user_id
+        }, user_id=user_id)
 
-    def create_obra(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    def create_obra(self, data: Dict[str, Any], user_id: Optional[str] = None) -> Dict[str, Any]:
         obra_id = to_uuid(data.get("id"))
+        target_user_id = user_id or data.get("user_id")
         item = {
             "id": obra_id,
             "nombre": data.get("nombre", "Nueva Obra"),
@@ -126,6 +187,7 @@ class SupabaseService:
             "total_gastado_bs": float(data.get("total_gastado_bs", 0.0)),
             "estado": data.get("estado", "activa"),
             "telegram_chat_id": data.get("telegram_chat_id"),
+            "user_id": target_user_id,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
@@ -134,7 +196,14 @@ class SupabaseService:
             try:
                 self.client.table("obras").upsert(item).execute()
             except Exception as e:
-                print(f"Error Supabase create_obra: {e}")
+                if "user_id" in str(e).lower():
+                    db_item = {k: v for k, v in item.items() if k != "user_id"}
+                    try:
+                        self.client.table("obras").upsert(db_item).execute()
+                    except Exception as e2:
+                        print(f"Error Supabase create_obra retry: {e2}")
+                else:
+                    print(f"Error Supabase create_obra: {e}")
         return item
 
     def update_obra(self, obra_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -302,7 +371,8 @@ class SupabaseService:
         if self.is_connected and self.client:
             try:
                 res = self.client.table("facturas").select("*").eq("obra_id", clean_obra_id).order("created_at", desc=True).execute()
-                return res.data or []
+                if res.data is not None and len(res.data) > 0:
+                    return res.data
             except Exception as e:
                 print(f"Error Supabase get_facturas: {e}")
         return [f for f in self._memory_store["facturas"].values() if f.get("obra_id") in (clean_obra_id, obra_id)]
@@ -347,6 +417,12 @@ class SupabaseService:
             try:
                 self.client.table("facturas").upsert(data).execute()
             except Exception as e:
+                if "user_id" in str(e).lower():
+                    db_item = {k: v for k, v in data.items() if k != "user_id"}
+                    try:
+                        self.client.table("facturas").upsert(db_item).execute()
+                    except Exception:
+                        pass
                 print(f"Error Supabase save_factura: {e}")
         return data
 
@@ -358,7 +434,8 @@ class SupabaseService:
         if self.is_connected and self.client:
             try:
                 res = self.client.table("evidencias_avance").select("*").eq("obra_id", clean_obra_id).order("created_at", desc=True).execute()
-                return res.data or []
+                if res.data is not None and len(res.data) > 0:
+                    return res.data
             except Exception as e:
                 print(f"Error Supabase get_evidencias: {e}")
         return [e for e in self._memory_store["evidencias_avance"].values() if e.get("obra_id") in (clean_obra_id, obra_id)]
@@ -388,7 +465,8 @@ class SupabaseService:
         if self.is_connected and self.client:
             try:
                 res = self.client.table("libro_obra").select("*").eq("obra_id", clean_obra_id).order("created_at", desc=True).execute()
-                return res.data or []
+                if res.data is not None and len(res.data) > 0:
+                    return res.data
             except Exception as e:
                 print(f"Error Supabase get_libro_obra: {e}")
         return [l for l in self._memory_store["libro_obra"].values() if l.get("obra_id") in (clean_obra_id, obra_id)]
@@ -500,28 +578,42 @@ class SupabaseService:
     # --------------------------------------------------------------------------
     # MEMORIA OPERATIVA: CATÁLOGO DE PRECIOS DEL USUARIO & HISTORIAL DE EDICIONES
     # --------------------------------------------------------------------------
-    def get_catalogo_precios(self) -> List[Dict[str, Any]]:
+    def get_catalogo_precios(self, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Devuelve todos los precios personalizados aprendidos del contratista."""
         if self.is_connected and self.client:
             try:
+                q = self.client.table("catalogo_precios_usuario").select("*")
+                if user_id:
+                    try:
+                        res = q.eq("user_id", user_id).order("updated_at", desc=True).execute()
+                        if res.data and len(res.data) > 0:
+                            return res.data
+                    except Exception:
+                        pass
                 res = self.client.table("catalogo_precios_usuario").select("*").order("updated_at", desc=True).execute()
                 if res.data:
                     return res.data
             except Exception:
                 pass
-        return list(self._memory_store["catalogo_precios_usuario"].values())
+        all_items = list(self._memory_store["catalogo_precios_usuario"].values())
+        if user_id:
+            user_items = [i for i in all_items if str(i.get("user_id") or "") == str(user_id)]
+            if user_items:
+                return user_items
+        return all_items
 
-    def get_catalogo_precios_dict(self) -> Dict[str, float]:
+    def get_catalogo_precios_dict(self, user_id: Optional[str] = None) -> Dict[str, float]:
         """Devuelve diccionario clave -> precio_usd para el calculador determinista."""
-        items = self.get_catalogo_precios()
+        items = self.get_catalogo_precios(user_id=user_id)
         return {item["clave_o_codigo"]: float(item["precio_usd"]) for item in items if "clave_o_codigo" in item and "precio_usd" in item}
 
-    def save_catalogo_precio(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    def save_catalogo_precio(self, data: Dict[str, Any], user_id: Optional[str] = None) -> Dict[str, Any]:
         """Registra o actualiza un precio personalizado en la memoria operativa."""
         clave = str(data.get("clave_o_codigo", "")).strip().lower()
         if not clave:
             clave = str(uuid.uuid4())
         
+        target_user_id = user_id or data.get("user_id")
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         item = {
             "id": to_uuid(data.get("id") or clave),
@@ -531,6 +623,7 @@ class SupabaseService:
             "unidad": data.get("unidad", "und"),
             "precio_usd": float(data.get("precio_usd", 0.0)),
             "proveedor_opcional": data.get("proveedor_opcional"),
+            "user_id": target_user_id,
             "created_at": data.get("created_at") or now_iso,
             "updated_at": now_iso
         }
@@ -539,8 +632,13 @@ class SupabaseService:
         if self.is_connected and self.client:
             try:
                 self.client.table("catalogo_precios_usuario").upsert(item).execute()
-            except Exception:
-                pass
+            except Exception as e:
+                if "user_id" in str(e).lower():
+                    db_item = {k: v for k, v in item.items() if k != "user_id"}
+                    try:
+                        self.client.table("catalogo_precios_usuario").upsert(db_item).execute()
+                    except Exception:
+                        pass
         return item
 
     def get_historial_ediciones(self, obra_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -767,14 +865,176 @@ class SupabaseService:
 
         return {"status": "ok", "obra_id": obra_id, "message": "Datos de obra demo cargados exitosamente con UUIDs válidos."}
 
+    # --------------------------------------------------------------------------
+    # SESIONES DE LEVANTAMIENTO (PERSISTENCIA Y RECUPERACIÓN DE CONTEXTO)
+    # --------------------------------------------------------------------------
+    def get_sesion_activa_o_esperando(self, telegram_chat_id: str) -> Optional[Dict[str, Any]]:
+        str_chat_id = str(telegram_chat_id)
+        if self.is_connected and self.client:
+            try:
+                res = self.client.table("sesiones_levantamiento")\
+                    .select("*")\
+                    .eq("telegram_chat_id", str_chat_id)\
+                    .in_("estado", ["activo", "esperando_aclaracion"])\
+                    .order("updated_at", desc=True)\
+                    .limit(1)\
+                    .execute()
+                if res.data:
+                    return res.data[0]
+            except Exception:
+                pass
+
+        candidatos = [
+            s for s in self._memory_store["sesiones_levantamiento"].values()
+            if str(s.get("telegram_chat_id")) == str_chat_id and s.get("estado") in ["activo", "esperando_aclaracion"]
+        ]
+        if candidatos:
+            candidatos.sort(key=lambda x: str(x.get("updated_at", "")), reverse=True)
+            return candidatos[0]
+        return None
+
+    def get_sesion_by_obra(self, telegram_chat_id: str, obra_id: str) -> Optional[Dict[str, Any]]:
+        str_chat_id = str(telegram_chat_id)
+        clean_obra_id = to_uuid(obra_id)
+        if self.is_connected and self.client:
+            try:
+                res = self.client.table("sesiones_levantamiento")\
+                    .select("*")\
+                    .eq("telegram_chat_id", str_chat_id)\
+                    .eq("obra_id", clean_obra_id)\
+                    .order("updated_at", desc=True)\
+                    .limit(1)\
+                    .execute()
+                if res.data:
+                    return res.data[0]
+            except Exception:
+                pass
+
+        candidatos = [
+            s for s in self._memory_store["sesiones_levantamiento"].values()
+            if str(s.get("telegram_chat_id")) == str_chat_id and str(s.get("obra_id")) == str(clean_obra_id)
+        ]
+        if candidatos:
+            candidatos.sort(key=lambda x: str(x.get("updated_at", "")), reverse=True)
+            return candidatos[0]
+        return None
+
+    def save_sesion(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
+        sesion_id = session_data.get("id") or str(uuid.uuid4())
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        target_user_id = session_data.get("user_id")
+        
+        item = {
+            "id": sesion_id,
+            "telegram_chat_id": str(session_data.get("telegram_chat_id", "")),
+            "obra_id": to_uuid(session_data.get("obra_id")) if session_data.get("obra_id") else None,
+            "obra_nombre": session_data.get("obra_nombre", "Obra"),
+            "estado": session_data.get("estado", "activo"),
+            "rondas_preguntas": int(session_data.get("rondas_preguntas", 0)),
+            "borrador_json": session_data.get("borrador_json") or {},
+            "historial_mensajes": session_data.get("historial_mensajes") or [],
+            "user_id": target_user_id,
+            "updated_at": now_iso
+        }
+        if "created_at" in session_data:
+            item["created_at"] = session_data["created_at"]
+        else:
+            item["created_at"] = now_iso
+
+        self._memory_store["sesiones_levantamiento"][sesion_id] = item
+
+        if self.is_connected and self.client:
+            try:
+                res = self.client.table("sesiones_levantamiento").upsert(item).execute()
+                if res.data:
+                    return res.data[0]
+            except Exception as e:
+                if "user_id" in str(e).lower():
+                    db_item = {k: v for k, v in item.items() if k != "user_id"}
+                    try:
+                        res = self.client.table("sesiones_levantamiento").upsert(db_item).execute()
+                        if res.data:
+                            return res.data[0]
+                    except Exception:
+                        pass
+                # Silencioso si aún no se ha ejecutado el SQL en Supabase
+                print(f"Aviso Supabase save_sesion (usando fallback en memoria): {e}")
+
+        return item
+
+    def complete_sesion(self, session_id: str, borrador_final: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        updates = {
+            "estado": "completado",
+            "updated_at": now_iso
+        }
+        if borrador_final is not None:
+            updates["borrador_json"] = borrador_final
+
+        if session_id in self._memory_store["sesiones_levantamiento"]:
+            self._memory_store["sesiones_levantamiento"][session_id].update(updates)
+
+        if self.is_connected and self.client:
+            try:
+                res = self.client.table("sesiones_levantamiento").update(updates).eq("id", session_id).execute()
+                if res.data:
+                    return res.data[0]
+            except Exception as e:
+                print(f"Aviso Supabase complete_sesion: {e}")
+
+        return self._memory_store["sesiones_levantamiento"].get(session_id)
+
+    def get_recent_obras(self, telegram_chat_id: Optional[str] = None, user_id: Optional[str] = None, limit: int = 5) -> List[Dict[str, Any]]:
+        if not user_id and telegram_chat_id:
+            perfil = self.get_perfil_by_chat_id(telegram_chat_id)
+            if perfil:
+                user_id = perfil.get("user_id")
+
+        all_obras = self.get_obras(user_id=user_id)
+        if user_id:
+            matching = [o for o in all_obras if str(o.get("user_id") or "") == str(user_id)]
+            if matching:
+                return matching[:limit]
+        if telegram_chat_id:
+            str_chat_id = str(telegram_chat_id)
+            matching = [o for o in all_obras if str(o.get("telegram_chat_id") or "") == str_chat_id]
+            if matching:
+                return matching[:limit]
+        return all_obras[:limit]
+
+    def set_active_obra(self, telegram_chat_id: str, obra_id: str) -> Optional[Dict[str, Any]]:
+        clean_id = to_uuid(obra_id)
+        for o in self.get_obras():
+            if str(o.get("telegram_chat_id")) == str(telegram_chat_id) and o["id"] != clean_id:
+                self.update_obra(o["id"], {"estado": "pausada"})
+
+        int_chat_id = int(telegram_chat_id) if str(telegram_chat_id).isdigit() else None
+        return self.update_obra(clean_id, {
+            "estado": "activa",
+            "telegram_chat_id": int_chat_id
+        })
+
+    def clear_sesiones_chat(self, telegram_chat_id: str) -> None:
+        str_chat_id = str(telegram_chat_id)
+        to_del = [sid for sid, s in self._memory_store["sesiones_levantamiento"].items() if str(s.get("telegram_chat_id")) == str_chat_id]
+        for sid in to_del:
+            del self._memory_store["sesiones_levantamiento"][sid]
+
+        if self.is_connected and self.client:
+            try:
+                self.client.table("sesiones_levantamiento").delete().eq("telegram_chat_id", str_chat_id).execute()
+            except Exception:
+                pass
+
     def clear_all_data(self, create_default: bool = True) -> Dict[str, Any]:
         """
         Limpia completamente todas las tablas de Supabase y el almacén en memoria
-        (libro_obra, evidencias_avance, facturas, hoja_compras, cargas_fiscales, partidas, obras).
+        (libro_obra, evidencias_avance, facturas, hoja_compras, cargas_fiscales, partidas, obras, sesiones_levantamiento).
         Opcionalmente crea una obra limpia inicial con presupuesto y gastos en 0.
         """
         deleted_counts = {}
         tables_to_clear = [
+            "sesiones_levantamiento",
             "historial_ediciones",
             "libro_obra",
             "evidencias_avance",
@@ -808,5 +1068,124 @@ class SupabaseService:
             "deleted_counts": deleted_counts,
             "obra_activa": obra_limpia
         }
+
+    # --------------------------------------------------------------------------
+    # 14. PERFILES TELEGRAM & AUTENTICACIÓN MULTIUSUARIO
+    # --------------------------------------------------------------------------
+    def get_perfil_by_chat_id(self, chat_id: Union[str, int]) -> Optional[Dict[str, Any]]:
+        str_chat_id = str(chat_id).strip()
+        if self.is_connected and self.client:
+            try:
+                res = self.client.table("perfiles_telegram").select("*").eq("telegram_chat_id", str_chat_id).limit(1).execute()
+                if res.data and len(res.data) > 0:
+                    return res.data[0]
+            except Exception:
+                pass
+        for p in self._memory_store["perfiles_telegram"].values():
+            if str(p.get("telegram_chat_id") or "") == str_chat_id:
+                return p
+        return None
+
+    def get_perfil_by_user_id(self, user_id: str) -> Optional[Dict[str, Any]]:
+        str_user_id = str(user_id).strip()
+        if self.is_connected and self.client:
+            try:
+                res = self.client.table("perfiles_telegram").select("*").eq("user_id", str_user_id).limit(1).execute()
+                if res.data and len(res.data) > 0:
+                    return res.data[0]
+            except Exception:
+                pass
+        return self._memory_store["perfiles_telegram"].get(str_user_id)
+
+    def get_perfil_by_codigo(self, codigo: str) -> Optional[Dict[str, Any]]:
+        clean_code = str(codigo).strip()
+        if self.is_connected and self.client:
+            try:
+                res = self.client.table("perfiles_telegram").select("*").eq("codigo_vinculacion", clean_code).limit(1).execute()
+                if res.data and len(res.data) > 0:
+                    return res.data[0]
+            except Exception:
+                pass
+        for p in self._memory_store["perfiles_telegram"].values():
+            if str(p.get("codigo_vinculacion") or "").strip() == clean_code:
+                return p
+        return None
+
+    def get_perfil_by_api_key(self, api_key: str) -> Optional[Dict[str, Any]]:
+        clean_key = str(api_key).strip()
+        if not clean_key:
+            return None
+        if self.is_connected and self.client:
+            try:
+                res = self.client.table("perfiles_telegram").select("*").eq("api_key_mcp", clean_key).limit(1).execute()
+                if res.data and len(res.data) > 0:
+                    return res.data[0]
+            except Exception:
+                pass
+        for p in self._memory_store["perfiles_telegram"].values():
+            if str(p.get("api_key_mcp") or "").strip() == clean_key:
+                return p
+        return None
+
+    def get_or_create_perfil(self, user_id: str) -> Dict[str, Any]:
+        str_user_id = str(user_id).strip()
+        existing = self.get_perfil_by_user_id(str_user_id)
+        if existing:
+            return existing
+
+        if str_user_id in self._memory_store["perfiles_telegram"]:
+            return self._memory_store["perfiles_telegram"][str_user_id]
+
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        codigo = f"{random.randint(100000, 999999)}"
+        api_key = f"obx_mcp_{secrets.token_hex(16)}"
+        perfil_id = to_uuid(str_user_id)
+
+        item = {
+            "id": perfil_id,
+            "user_id": str_user_id,
+            "telegram_chat_id": None,
+            "codigo_vinculacion": codigo,
+            "api_key_mcp": api_key,
+            "created_at": now_iso,
+            "updated_at": now_iso
+        }
+        self._memory_store["perfiles_telegram"][str_user_id] = item
+
+        if self.is_connected and self.client:
+            try:
+                res = self.client.table("perfiles_telegram").upsert(item).execute()
+                if res.data and len(res.data) > 0:
+                    return res.data[0]
+            except Exception as e:
+                print(f"Aviso Supabase get_or_create_perfil (almacenado en memoria): {e}")
+
+        return item
+
+    def vincular_telegram_chat(self, codigo: str, chat_id: Union[str, int]) -> Optional[Dict[str, Any]]:
+        clean_code = str(codigo).strip()
+        str_chat_id = str(chat_id).strip()
+        perfil = self.get_perfil_by_codigo(clean_code)
+        if not perfil:
+            return None
+
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        perfil["telegram_chat_id"] = str_chat_id
+        perfil["updated_at"] = now_iso
+        user_id = perfil.get("user_id")
+
+        if user_id:
+            self._memory_store["perfiles_telegram"][str(user_id)] = perfil
+
+        if self.is_connected and self.client:
+            try:
+                self.client.table("perfiles_telegram").update({
+                    "telegram_chat_id": str_chat_id,
+                    "updated_at": now_iso
+                }).eq("codigo_vinculacion", clean_code).execute()
+            except Exception as e:
+                print(f"Aviso Supabase vincular_telegram_chat (actualizado en memoria): {e}")
+
+        return perfil
 
 supabase_service = SupabaseService()

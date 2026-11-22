@@ -1,4 +1,5 @@
 import os
+import sys
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -10,6 +11,7 @@ from routers.api import router as api_router
 from bot.telegram_bot import telegram_bot
 from services.supabase_service import supabase_service
 from services.bcv_service import bcv_service
+from mcp_server import mcp as mcp_instance
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -47,28 +49,33 @@ async def lifespan(app: FastAPI):
 
     # 3. Inicializar e iniciar Telegram Bot con Long Polling en segundo plano
     telegram_app = None
+    lock_fp = None
     lock_file = os.path.join(os.path.dirname(__file__), "telegram_bot.lock")
     if settings.TELEGRAM_BOT_TOKEN:
+        can_poll = False
         try:
-            my_pid = os.getpid()
-            can_poll = True
-            if os.path.exists(lock_file):
+            lock_fp = open(lock_file, "a+")
+            lock_fp.seek(0)
+            if sys.platform == "win32":
+                import msvcrt
                 try:
-                    with open(lock_file, "r") as f:
-                        existing_pid = int(f.read().strip())
-                    if existing_pid != my_pid:
-                        try:
-                            os.kill(existing_pid, 0)
-                            print(f"Aviso: Proceso PID {existing_pid} ya está escuchando Telegram. Instancia actual operará en modo REST.")
-                            can_poll = False
-                        except OSError:
-                            can_poll = True
-                except Exception:
+                    msvcrt.locking(lock_fp.fileno(), msvcrt.LK_NBLCK, 1)
                     can_poll = True
+                except (IOError, OSError):
+                    can_poll = False
+            else:
+                import fcntl
+                try:
+                    fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    can_poll = True
+                except (IOError, OSError):
+                    can_poll = False
 
             if can_poll:
-                with open(lock_file, "w") as f:
-                    f.write(str(my_pid))
+                lock_fp.truncate(0)
+                lock_fp.write(str(os.getpid()))
+                lock_fp.flush()
+                print(f"Bloqueo exclusivo de Telegram adquirido (PID {os.getpid()}).")
                 print("Iniciando Bot de Telegram mediante Long Polling...")
                 telegram_app = await telegram_bot.init_application()
                 if telegram_app:
@@ -78,11 +85,13 @@ async def lifespan(app: FastAPI):
                     telegram_bot.is_running = True
                     telegram_bot.bot_info["status"] = "running"
                     telegram_bot.bot_info["polling"] = True
-                    print(f"Bot de Telegram activo (PID {my_pid}) y escuchando mensajes por Long Polling.")
+                    print(f"Bot de Telegram activo (PID {os.getpid()}) y escuchando mensajes por Long Polling.")
             else:
+                print("Aviso: Otra instancia del servidor ya está gestionando Telegram. Esta instancia operará en modo API REST.")
                 telegram_bot.bot_info["status"] = "running_in_other_instance"
+                telegram_bot.bot_info["polling"] = False
         except Exception as e:
-            print(f"Error al iniciar Long Polling de Telegram: {e}")
+            print(f"Aviso al configurar polling de Telegram: {e}")
             telegram_bot.bot_info["status"] = f"error: {e}"
     else:
         print("TELEGRAM_BOT_TOKEN vacío. El servidor funcionará en modo REST API / Web.")
@@ -101,11 +110,17 @@ async def lifespan(app: FastAPI):
             print("Bot de Telegram detenido de forma segura.")
         except Exception as e:
             print(f"Error apagando Telegram Bot: {e}")
-    if os.path.exists(lock_file):
+    if lock_fp:
         try:
-            with open(lock_file, "r") as f:
-                if int(f.read().strip()) == os.getpid():
-                    os.remove(lock_file)
+            if sys.platform == "win32":
+                import msvcrt
+                try:
+                    msvcrt.locking(lock_fp.fileno(), msvcrt.LK_UNLCK, 1)
+                except Exception:
+                    pass
+            lock_fp.close()
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
         except Exception:
             pass
 
@@ -127,6 +142,9 @@ app.add_middleware(
 
 # Montar Router de la API REST
 app.include_router(api_router)
+
+# Montar Servidor FastMCP con transporte HTTP/SSE
+app.mount("/mcp", mcp_instance.http_app(transport="sse"))
 
 @app.get("/")
 def root():
